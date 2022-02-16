@@ -27,6 +27,7 @@ class Stage extends Logging
   private[this] var _optimization: Boolean = false
   private[this] var _end: Boolean = true
   private[this] var _parallel: Boolean = true
+  private[this] var _parallelism: Int = _
   private[this] var _stageId: Int = _
   private[this] var _deliverable: Array[Deliverable[_]] = _
   private[this] val _benchmarkResult: ArrayBuffer[BenchmarkResult] = ArrayBuffer.empty
@@ -68,6 +69,17 @@ class Stage extends Logging
     this
   }
 
+  /**
+   * Set parallelism level(>0) to run all factories of this stage in parallel.
+   * Otherwise they will be executed in sequential order
+   * @param parallelism set parallelism level(>0)
+   */
+  def parallel(parallelism: Int): this.type = {
+    _parallelism = parallelism
+
+    this
+  }
+
   /** Return true if the pipeline execution will be optimized by the given optimizer */
   def optimization: Boolean = this._optimization
 
@@ -90,8 +102,7 @@ class Stage extends Logging
    * @param constructorArgs arguments of the factory's primary constructor
    * @return an object of type Factory[_]
    */
-  private[this] def instantiateFactory(cls: Class[_ <: Factory[_]],
-                                       constructorArgs: Array[Object]): Factory[_] = {
+  private[this] def instantiateFactory(cls: Class[_ <: Factory[_]], constructorArgs: Array[Object]): Factory[_] = {
     val primaryConstructor = cls.getConstructors.head
 
     val newFactory = if (primaryConstructor.getParameterCount == 0) {
@@ -114,8 +125,7 @@ class Stage extends Logging
   @throws[IllegalArgumentException](
     "Exception will be thrown if the length of constructor arguments are not correct"
   )
-  def addFactory(factory: Class[_ <: Factory[_]],
-                 constructorArgs: Object*): this.type = {
+  def addFactory(factory: Class[_ <: Factory[_]], constructorArgs: Object*): this.type = {
     addFactory(instantiateFactory(factory, constructorArgs.toArray))
   }
 
@@ -131,8 +141,10 @@ class Stage extends Logging
   @throws[IllegalArgumentException](
     "Exception will be thrown if the length of constructor arguments are not correct"
   )
-  def addFactory[T <: Factory[_] : ClassTag](constructorArgs: Array[Object] = Array.empty,
-                                             writable: Boolean = true): this.type = {
+  def addFactory[T <: Factory[_]: ClassTag](
+    constructorArgs: Array[Object] = Array.empty,
+    writable: Boolean = true
+  ): this.type = {
     val cls = implicitly[ClassTag[T]].runtimeClass.asInstanceOf[Class[T]]
     addFactory(instantiateFactory(cls, constructorArgs).writable(writable))
   }
@@ -162,7 +174,16 @@ class Stage extends Logging
     _deliverable = parallelFactories match {
       case Left(par) =>
         logDebug(s"Stage $stageId will be run in parallel mode")
-        par.map(runFactory).toArray
+        if (_parallelism > 0) {
+          val forkJoinPool = new java.util.concurrent.ForkJoinPool(_parallelism)
+          try {
+            par.map(runFactory).toArray
+          } finally {
+            forkJoinPool.shutdown()
+          }
+        } else {
+          par.map(runFactory).toArray
+        }
 
       case Right(nonpar) =>
         logDebug(s"Stage $stageId will be run in sequential mode")
@@ -221,30 +242,29 @@ class Stage extends Logging
   }
 
   /** Execute a factory and return the deliverable of this factory */
-  private[this] val runFactory: Factory[_] => Deliverable[_] = {
-    factory: Factory[_] =>
-      // Set job group to the factory name
-      this.withSparkSessionDo(_.sparkContext.setJobGroup(factory.getPrettyName, null))
+  private[this] val runFactory: Factory[_] => Deliverable[_] = { factory: Factory[_] =>
+    // Set job group to the factory name
+    this.withSparkSessionDo(_.sparkContext.setJobGroup(factory.getPrettyName, null))
 
-      if (this.benchmark.getOrElse(false) && factory.getClass.isAnnotationPresent(classOf[Benchmark])) {
-        // Benchmark the factory when this stage has the Benchmark set to true and
-        // the factory has the Benchmark annotation
-        val factoryBench = handleBenchmark(factory)
-        _benchmarkResult.append(factoryBench)
+    if (this.benchmark.getOrElse(false) && factory.getClass.isAnnotationPresent(classOf[Benchmark])) {
+      // Benchmark the factory when this stage has the Benchmark set to true and
+      // the factory has the Benchmark annotation
+      val factoryBench = handleBenchmark(factory)
+      _benchmarkResult.append(factoryBench)
 
-      } else {
-        // Otherwise run the factory without benchmarking
-        factory.read().process()
-        if (shouldWrite(factory)) {
-          logDebug(s"Persist output of ${factory.getPrettyName}")
-          factory.write()
-        }
-
+    } else {
+      // Otherwise run the factory without benchmarking
+      factory.read().process()
+      if (shouldWrite(factory)) {
+        logDebug(s"Persist output of ${factory.getPrettyName}")
+        factory.write()
       }
 
-      // Clear the job group after the execution
-      this.withSparkSessionDo(_.sparkContext.clearJobGroup())
-      factory.getDelivery
+    }
+
+    // Clear the job group after the execution
+    this.withSparkSessionDo(_.sparkContext.clearJobGroup())
+    factory.getDelivery
   }
 
   /** Return true if both this stage and the factory are writable, otherwise false */
